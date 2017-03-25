@@ -4,28 +4,8 @@ from collections import defaultdict
 from itertools import count
 import sys
 
-
-def init():
-    global characters, int2char, char2int, VOCAB_SIZE, model, params, LAYERS, INPUT_DIM, HIDDEN_DIM
-    model = dn.Model()
-    LAYERS = 6
-    INPUT_DIM = 50
-    HIDDEN_DIM = 50
-    characters = list("abcdefghijklmnopqrstuvwxyz ,.(){};\n1234567890+-*/=<>!&|_")
-    characters.append("<EOS>")
-    characters.append("<SOS>")
-
-    int2char = list(characters)
-    char2int = {c:i for i,c in enumerate(characters)}
-
-    VOCAB_SIZE = len(characters)
-    params = {}
-    params["lookup"] = model.add_lookup_parameters((VOCAB_SIZE, INPUT_DIM))
-    params["R"] = model.add_parameters((VOCAB_SIZE, HIDDEN_DIM))
-    params["C"] = model.add_parameters((HIDDEN_DIM, HIDDEN_DIM))
-    params["bias"] = model.add_parameters((VOCAB_SIZE))
-    
-
+BEG_SEQ = "<S>"
+END_SEQ = "</S>"
 
 def sample_index(probs):
     rnd = random.random()
@@ -33,91 +13,102 @@ def sample_index(probs):
         rnd -= p
         if rnd <= 0: break
     return i
-def get_model():
-    global characters, int2char, char2int, VOCAB_SIZE, model, params, LAYERS, INPUT_DIM, HIDDEN_DIM
-    lstm_encode = dn.LSTMBuilder(LAYERS, INPUT_DIM, HIDDEN_DIM, model)
-    lstm_decode = dn.LSTMBuilder(LAYERS, INPUT_DIM, HIDDEN_DIM, model)
-    return lstm_encode, lstm_decode
-# return compute loss of RNN for one sentence
-def do_one_sentence(rnn_enc, rnn_dec, in_sentence, out_sentence):
-    from numpy import argmax
-    global characters, int2char, char2int, VOCAB_SIZE, model, params, LAYERS, INPUT_DIM, HIDDEN_DIM
-    # setup the sentence
-    dn.renew_cg()
 
-
-    R = dn.parameter(params["R"])
-    C = dn.parameter(params["C"])
-    bias = dn.parameter(params["bias"])
-    lookup = params["lookup"]
-    in_sentence = ["<SOS>"] + list(in_sentence) + ["<EOS>"]
-    out_sentence = ["<SOS>"] + list(out_sentence) + ["<EOS>"]
-    s0 = rnn_enc.initial_state()
-    s = s0
-    for char in in_sentence:
-        s = s.add_input(lookup[char2int[char]])
-    s_enc = s
-    loss = []
-    s0 = rnn_dec.initial_state()
-    s = s0
-    for char, next_char in zip(out_sentence, out_sentence[1:]):
-        s = s.add_input(lookup[char2int[char]])
-        probs = dn.softmax(R*(s.output()+C*s_enc.output()) + bias)
-        loss.append( -dn.log(dn.pick(probs,char2int[next_char])) )
-        # loss.append( dn.pickneglogsoftmax(probs,char2int[char]) )
-    loss = dn.esum(loss)
-    return loss
-
-
-# generate from model:
-def generate(rnn_enc, rnn_dec, sentence):
-
-    # setup the sentence
-    dn.renew_cg()
-
-    R = dn.parameter(params["R"])
-    C = dn.parameter(params["C"])
-    bias = dn.parameter(params["bias"])
-    lookup = params["lookup"]
-    sentence = ["<SOS>"] + list(sentence) + ["<EOS>"]
-    s0 = rnn_enc.initial_state()
-    s = s0
-    ss = []
-    for char in sentence:
-        s = s.add_input(lookup[char2int[char]])
+# input all thing to lstm
+# return (final state, list of all states)
+def input_all(lstm_state, input_list):
+    s = lstm_state
+    ss = [s]
+    for i in input_list:
+        s = s.add_input(i)
         ss.append(s)
-    s_enc = s
-    s0 = rnn_dec.initial_state()
-    s = s0.add_input(lookup[char2int["<SOS>"]])
-    out=[]
-    while True:
-        probs = dn.softmax(R*(s.output()+C*s_enc.output()) + bias)
-        probs = probs.vec_value()
-        next_char = sample_index(probs)
-        out.append(int2char[next_char])
-        if out[-1] == "<EOS>" or len(out)>20: break
-        s = s.add_input(lookup[next_char])
-    return "".join(out[:-1]) # strip the <EOS>
+    return s, ss
+
+class BasicModel(object):
+    def __init__(self):
+        self.characters = list("abcdefghijklmnopqrstuvwxyz ,.(){};\n1234567890+-*/=<>!&|_")+[BEG_SEQ, END_SEQ]
+        self.int2char = self.characters
+        self.char2int = {c:i for i,c in enumerate(self.int2char)}
+        self.vocab_size = len(self.int2char)
+    def wrap_sentence(self, s):
+        return [ self.char2int[c] for c in [BEG_SEQ]+list(s)+[END_SEQ] ]
+
+class Seq2Seq(BasicModel):
+    def __init__(self, n_layers=4, input_dim=50, hidden_dim=50):
+        super(self.__class__, self).__init__()
+        self.layers = n_layers
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.model = dn.Model()
+        self.p = {}
+        p = self.p
+        model = self.model
+        p["lookup"] = model.add_lookup_parameters((self.vocab_size, self.input_dim))
+        p["R"] = model.add_parameters((self.vocab_size, self.hidden_dim))
+        p["C"] = model.add_parameters((self.vocab_size, self.hidden_dim))
+        p["bias"] = model.add_parameters((self.vocab_size))
+        self.encoder = dn.LSTMBuilder(self.layers, self.input_dim, self.hidden_dim, model)
+        self.decoder = dn.LSTMBuilder(self.layers, self.input_dim, self.hidden_dim, model)
+    # lookup, R, C, bias, encoder, decoder = self.get_params()
+    def get_params(self):
+        f = dn.parameter
+        p = self.p
+        return p['lookup'], f(p['R']), f(p['C']), f(p['bias']), self.encoder, self.decoder
+    # return compute loss of RNN for one sentence
+    def compute_loss(self, in_sentence, out_sentence):
+        from numpy import argmax
+        dn.renew_cg()
+        lookup, R, C, bias, encoder, decoder = self.get_params()
+        in_s, out_s = self.wrap_sentence(in_sentence), self.wrap_sentence(out_sentence)
+
+        loss = []
+        enc_s, _ = input_all(encoder.initial_state(), [lookup[c] for c in in_s])
+        s = decoder.initial_state().add_input(enc_s.output())
+        for char, next_char in zip(out_s, out_s[1:]):
+            s = s.add_input(lookup[char])
+            probs = dn.softmax(R*s.output() + bias)
+            loss.append( -dn.log(dn.pick(probs,next_char)) )
+            # loss.append( dn.pickneglogsoftmax(probs,next_char) )
+        loss = dn.esum(loss)
+        return loss
+    # generate from model:
+    def generate(self, sentence):
+        dn.renew_cg()
+
+        lookup, R, C, bias, encoder, decoder = self.get_params()
+        sentence = self.wrap_sentence(sentence)
+        enc_s, _ = input_all(encoder.initial_state(), [lookup[c] for c in sentence])
+        s = decoder.initial_state().add_input(enc_s.output())
+        out=[]
+        while True:
+            probs = dn.softmax(R*s.output() + bias)
+            next_char = sample_index(probs.vec_value())
+            out.append(self.int2char[next_char])
+            if out[-1] == END_SEQ or len(out)>20: break
+            s = s.add_input(lookup[next_char])
+        return "".join(out[:-1]) # strip the <EOS>
 
 
-# train, and generate every 5 samples
-def train(rnn_enc, rnn_dec, sentence_pairs, n_round=200):
-    global characters, int2char, char2int, VOCAB_SIZE, model, params, LAYERS, INPUT_DIM, HIDDEN_DIM
-    trainer = dn.SimpleSGDTrainer(model)
+# train, and generate every 5% samples
+def train(seq2seq, sentence_pairs, n_round=200):
+    trainer = dn.SimpleSGDTrainer(seq2seq.model)
     for i in xrange(n_round):
-        if i % ((n_round+19)/20) == 0:
-            n = len(sentence_pairs)
-            idx = sample_index([1.0/n for i in range(n)])
+        if (i+1) % ((n_round+19)/20) == 0:
+            from random import randint
+            idx = randint(0, len(sentence_pairs)-1)
         else:
             idx = -1
         for i, (in_s, out_s) in enumerate(sentence_pairs):
-            out_s = in_s
-            loss = do_one_sentence(rnn_enc, rnn_dec, in_s, out_s[::-1])
+            loss = seq2seq.compute_loss(in_s, out_s[::-1])
             loss_value = loss.value()
             loss.backward()
             trainer.update()
             if i==idx:
                 print loss_value, idx,
-                print in_s,
-                print generate(rnn_enc, rnn_dec, in_s)[::-1]
+                print in_s, " >>> ", 
+                print seq2seq.generate(in_s)[::-1]
+
+
+
+
 
